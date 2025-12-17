@@ -1,7 +1,8 @@
 from typing import Dict, List, Optional
+import difflib
 from threading import Lock
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -49,10 +50,15 @@ class Product(BaseModel):
     price: float
 
 
-class SearchResponse(BaseModel):
+class SearchResult(BaseModel):
+    query: str
     found: bool
     product: Optional[Product] = None
-    suggestions: List[Product] = []
+
+
+class BulkSearchResponse(BaseModel):
+    results: List[SearchResult]
+    not_found: List[str]
 
 
 class ModifyItem(BaseModel):
@@ -107,24 +113,50 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/products/search", response_model=SearchResponse)
-def search_products(query: str) -> SearchResponse:
-    query_lower = query.lower().strip()
-    if not query_lower:
-        raise HTTPException(status_code=400, detail="Query must not be empty")
+@app.get("/products/search", response_model=BulkSearchResponse)
+def search_products(queries: List[str] = Query(...)) -> BulkSearchResponse:
+    if not queries:
+        raise HTTPException(status_code=400, detail="Query list must not be empty")
 
-    exact_match = None
-    suggestions: List[Product] = []
+    results: List[SearchResult] = []
+    not_found_queries: List[str] = []
 
-    for pid, pdata in CATALOG.items():
-        product = Product(id=pid, name=pdata["name"], unit=pdata["unit"], price=float(pdata["price"]))
-        if pid == query_lower or pdata["name"].lower() == query_lower:
-            exact_match = product
-            break
-        if query_lower in pid or query_lower in pdata["name"].lower():
-            suggestions.append(product)
+    # Prepare a mapping of normalized name -> product_id for fuzzy matching
+    # We use all lowercase for simpler matching on the name
+    name_to_pid = {pdata["name"].lower(): pid for pid, pdata in CATALOG.items()}
+    all_names = list(name_to_pid.keys())
 
-    return SearchResponse(found=exact_match is not None, product=exact_match, suggestions=suggestions)
+    for q in queries:
+        q_norm = q.lower().strip()
+        if not q_norm:
+            continue
+
+        matched_product = None
+        
+        # 1. Exact ID match
+        if q_norm in CATALOG:
+             data = CATALOG[q_norm]
+             matched_product = Product(id=q_norm, name=data["name"], unit=data["unit"], price=float(data["price"]))
+        
+        # 2. Fuzzy name match if no ID match
+        if not matched_product:
+            # get_close_matches details:
+            # n=1: return top 1 best match
+            # cutoff=0.4: match threshold (0.0 to 1.0)
+            matches = difflib.get_close_matches(q_norm, all_names, n=1, cutoff=0.4)
+            if matches:
+                best_match_name = matches[0]
+                pid = name_to_pid[best_match_name]
+                data = CATALOG[pid]
+                matched_product = Product(id=pid, name=data["name"], unit=data["unit"], price=float(data["price"]))
+
+        if matched_product:
+            results.append(SearchResult(query=q, found=True, product=matched_product))
+        else:
+            results.append(SearchResult(query=q, found=False, product=None))
+            not_found_queries.append(q)
+
+    return BulkSearchResponse(results=results, not_found=not_found_queries)
 
 
 @app.post("/cart/add", response_model=CartResponse)
